@@ -1,3 +1,4 @@
+//deps
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
@@ -8,7 +9,6 @@ use std::{
     time::Duration,
     sync::atomic::{AtomicUsize, Ordering},
 };
-//deps
 use rayon::prelude::*;
 use std::sync::{Arc, Mutex};
 use std::num::NonZeroUsize;
@@ -1066,4 +1066,4 @@ async fn main() {
     if let Err(e) = Database::run().await {
         eprintln!("Application error: {}", e);
     }
-} // 1069 lines 😼
+} // 😼
