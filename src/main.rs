@@ -1,15 +1,16 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs::{File, OpenOptions},
-    io::Read,
+    fs::File,
     path::Path,
     sync::{Arc, Mutex},
     time::Instant,
 };
 use serde::{Deserialize, Serialize};
-use rmp_serde::{decode::from_read, encode::write};
+use rmp_serde::decode::from_read;
 use uuid::Uuid;
 use std::thread;
+use flate2::read::GzDecoder;
+use rand::{thread_rng, seq::SliceRandom};
 
 #[derive(Serialize, Deserialize, Clone)]
 struct Record {
@@ -46,11 +47,10 @@ impl Database {
         if !Path::new(&self.path).exists() {
             return Ok(());
         }
-        let mut file = File::open(&self.path)?;
-        let mut buf = Vec::new();
-        file.read_to_end(&mut buf)?;
-        if !buf.is_empty() {
-            let records: Vec<Record> = from_read(&*buf).unwrap_or_default();
+        let file = File::open(&self.path)?;
+        let decoder = GzDecoder::new(file);
+        if let Ok(records) = from_read(decoder) {
+            let records: Vec<Record> = records;
             let mut data_guard = self.data.lock().unwrap();
             for record in records {
                 data_guard.insert(record.id.clone(), record);
@@ -59,12 +59,25 @@ impl Database {
         Ok(())
     }
 
-    fn save(&self) -> std::io::Result<()> {
+    pub async fn save(&self) -> std::io::Result<()> {
         let data_guard = self.data.lock().unwrap();
         let records: Vec<_> = data_guard.values().cloned().collect();
-        drop(data_guard); // release lock
-        let mut file = OpenOptions::new().create(true).write(true).truncate(true).open(&self.path)?;
-        write(&mut file, &records).unwrap();
+        drop(data_guard);
+
+        tokio::task::spawn_blocking({
+            let path = self.path.clone();
+            move || -> std::io::Result<()> {
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&path)?;
+                rmp_serde::encode::write(&mut file, &records).unwrap();
+                Ok(())
+            }
+        })
+        .await??;
+
         Ok(())
     }
 
@@ -165,8 +178,28 @@ impl Database {
         data_guard.remove(id).is_some()
     }
 
+    fn run_random_queries(&self, count: usize) {
+        let mut rng = thread_rng();
+        let queries = [
+            ("age", (0..100).map(|n| n.to_string()).collect::<Vec<_>>()), 
+            ("name", (0..10).map(|n| format!("User{}", n * 1000)).collect()), 
+            ("email", (0..10).map(|n| format!("user{}@example.com", n * 1000)).collect()),
+        ];
+
+        for i in 0..count {
+            let (field, values) = queries.choose(&mut rng).unwrap();
+            let value = values.choose(&mut rng).unwrap();
+            let query_start = Instant::now();
+            let results = self.find_by_key(field, value);
+            println!(
+                "Query #{}: {}={} ({} results): {:?}", 
+                i + 1, field, value, results.len(), query_start.elapsed()
+            );
+        }
+    }
+
     // benchmark
-    pub fn run_benchmark(&self) -> std::io::Result<()> {
+    pub async fn run_benchmark(&self) -> std::io::Result<()> {
         let entries = 1_000_000;
         let create_start = Instant::now();
         for i in 0..entries {
@@ -179,17 +212,28 @@ impl Database {
         }
         println!("Create {} entries: {:?}", entries, create_start.elapsed());
 
+        // Rebuild indexes after creation
+        let index_start = Instant::now();
+        self.build_indexes();
+        println!("Build indexes: {:?}", index_start.elapsed());
+
         let read_start = Instant::now();
         let data = self.read_all();
         println!("Read {} entries: {:?}", data.len(), read_start.elapsed());
 
+        // Now queries will work since indexes are built
         let query_start = Instant::now();
         let results = self.find_by_key("age", "25");
         println!(
-            "Query by age=25 ({} results): {:?}",
-            results.len(),
+            "Query by age=25 ({} results): {:?}", 
+            results.len(), 
             query_start.elapsed()
         );
+
+        println!("\n=== Running 10 Random Queries ===");
+        let random_queries_start = Instant::now();
+        self.run_random_queries(10);
+        println!("Total random queries time: {:?}", random_queries_start.elapsed());
 
         let update_start = Instant::now();
         for item in data.iter().take(2000) {
@@ -199,24 +243,35 @@ impl Database {
         }
         println!("Batch update 2000 entries: {:?}", update_start.elapsed());
 
+        // Rebuild indexes after updates
+        let reindex_start = Instant::now();
+        self.build_indexes();
+        println!("Rebuild indexes after update: {:?}", reindex_start.elapsed());
+
         let delete_start = Instant::now();
         for item in data.iter().take(2000) {
             self.delete(&item.id);
         }
         println!("Batch delete 2000 entries: {:?}", delete_start.elapsed());
 
-        // Save at the end
-        self.save()?;
+        // Final index rebuild after deletions
+        self.build_indexes();
+
+        let save_start = Instant::now();
+        self.save().await?;
+        println!("Save to disk: {:?}", save_start.elapsed());
+        
         println!("=== Benchmark Complete ===");
         Ok(())
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let db = Database::new("rust_benchmark_data.pookie");
     match db.init() {
         Ok(_) => {
-            if let Err(e) = db.run_benchmark() {
+            if let Err(e) = db.run_benchmark().await {
                 eprintln!("Benchmark failed: {}", e);
             }
         },
